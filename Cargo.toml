@@ -14,9 +14,8 @@ anyhow = "1"
 futures-util = "0.3"
 clap = { version = "4.5.60", features = ["derive"] }
 zeroize = { version = "1.7", features = ["zeroize_derive"] }
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
+reqwest = { version = "0.13.2", default-features = false, features = ["rustls", "json", "stream"] }
 rpassword = "7"
-bytes = "1"
 
 [profile.release]
 opt-level = 3
@@ -29,4 +28,3 @@ strip = true
 axum = "0.8.8"
 tempfile = "3.27.0"
 tokio = "1"
-tower-http = "0.6.8"
