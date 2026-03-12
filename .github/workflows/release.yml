@@ -123,6 +123,7 @@ jobs:
           mkdir -p dist
           CID=$(docker create age-inbox-cli:release-${{ github.run_id }})
           docker cp "$CID":/usr/local/bin/age-inbox-cli "dist/age-inbox-cli-${{ steps.resolve_tag.outputs.tag }}-linux-amd64"
+          docker cp "$CID":/usr/local/bin/age-inbox-cli.exe "dist/age-inbox-cli-${{ steps.resolve_tag.outputs.tag }}-windows-amd64.exe"
           docker rm "$CID"
 
       - name: Create a GitHub release
@@ -132,7 +133,7 @@ jobs:
           tag: ${{ steps.resolve_tag.outputs.tag }}
           name: Release ${{ steps.resolve_tag.outputs.tag }}
           body: ${{ github.event_name == 'workflow_dispatch' && format('Manual release for {0} from {1}', steps.resolve_tag.outputs.tag, github.event.inputs.target_ref) || steps.tag_version.outputs.changelog }}
-          artifacts: dist/age-inbox-cli-${{ steps.resolve_tag.outputs.tag }}-linux-amd64
+          artifacts: dist/age-inbox-cli-*
           token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Log in to the Container registry
