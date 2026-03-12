@@ -1,0 +1,152 @@
+name: Create Release and Publish Docker Image
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version a publicar (ej. 1.2.3 o v1.2.3)"
+        required: true
+        type: string
+      target_ref:
+        description: "Rama o commit para ejecutar el release manual"
+        required: false
+        default: "main"
+        type: string
+
+jobs:
+  release-and-publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # Needed to create tags and releases
+      packages: write # Needed to publish to GHCR
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.target_ref || github.ref }}
+          fetch-depth: 0 # Needed for changelog generation and tags
+
+      - name: Bump version and push tag
+        if: ${{ github.event_name != 'workflow_dispatch' }}
+        id: tag_version
+        uses: mathieudutour/github-tag-action@v6.2
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          default_bump: false # Do not bump if no feat/fix/breaking commits are found
+
+      - name: Resolve release tag
+        id: resolve_tag
+        env:
+          INPUT_VERSION: ${{ github.event.inputs.version }}
+          AUTO_TAG: ${{ steps.tag_version.outputs.new_tag }}
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            VERSION="${INPUT_VERSION#v}"
+            if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
+              echo "Version invalida: $INPUT_VERSION"
+              echo "Usa semver, por ejemplo 1.2.3 o 1.2.3-rc.1"
+              exit 1
+            fi
+            TAG="v$VERSION"
+          else
+            TAG="$AUTO_TAG"
+            VERSION="${TAG#v}"
+          fi
+
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Sync Cargo version
+        if: ${{ steps.resolve_tag.outputs.tag != '' }}
+        env:
+          RELEASE_VERSION: ${{ steps.resolve_tag.outputs.version }}
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import re
+          from pathlib import Path
+
+          version = "${{ steps.resolve_tag.outputs.version }}"
+          cargo_toml = Path("Cargo.toml")
+          content = cargo_toml.read_text(encoding="utf-8")
+          updated, count = re.subn(
+              r'(?m)^version\s*=\s*"[^"]+"\s*$',
+              f'version = "{version}"',
+              content,
+              count=1,
+          )
+          if count != 1:
+              raise SystemExit("Could not update [package].version in Cargo.toml")
+          cargo_toml.write_text(updated, encoding="utf-8")
+          PY
+
+      - name: Set up Docker Buildx
+        if: ${{ steps.resolve_tag.outputs.tag != '' }}
+        uses: docker/setup-buildx-action@v4
+
+      - name: Extract metadata (tags, labels) for Docker
+        if: ${{ steps.resolve_tag.outputs.tag != '' }}
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=raw,value=latest
+            type=raw,value=${{ steps.resolve_tag.outputs.tag }}
+
+      - name: Build Docker image locally for release asset
+        if: ${{ steps.resolve_tag.outputs.tag != '' }}
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ./Dockerfile
+          load: true
+          tags: |
+            age-inbox-cli:release-${{ github.run_id }}
+            ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          platforms: linux/amd64
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Extract binary from Docker image
+        if: ${{ steps.resolve_tag.outputs.tag != '' }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          CID=$(docker create age-inbox-cli:release-${{ github.run_id }})
+          docker cp "$CID":/usr/local/bin/age-inbox-cli "dist/age-inbox-cli-${{ steps.resolve_tag.outputs.tag }}-linux-amd64"
+          docker rm "$CID"
+
+      - name: Create a GitHub release
+        if: ${{ steps.resolve_tag.outputs.tag != '' }}
+        uses: ncipollo/release-action@v1
+        with:
+          tag: ${{ steps.resolve_tag.outputs.tag }}
+          name: Release ${{ steps.resolve_tag.outputs.tag }}
+          body: ${{ github.event_name == 'workflow_dispatch' && format('Manual release for {0} from {1}', steps.resolve_tag.outputs.tag, github.event.inputs.target_ref) || steps.tag_version.outputs.changelog }}
+          artifacts: dist/age-inbox-cli-${{ steps.resolve_tag.outputs.tag }}-linux-amd64
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Log in to the Container registry
+        if: ${{ steps.resolve_tag.outputs.tag != '' }}
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push prebuilt Docker image tags
+        if: ${{ steps.resolve_tag.outputs.tag != '' }}
+        run: |
+          set -euo pipefail
+          echo "${{ steps.meta.outputs.tags }}" | while IFS= read -r tag; do
+            [ -n "$tag" ] && docker push "$tag"
+          done
