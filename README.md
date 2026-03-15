@@ -26,7 +26,7 @@ The compiled binary will be placed at `./target/release/age-inbox-cli`
 
 You can run the release image directly:
 ```bash
-docker run -it --rm ghcr.io/YOUR_ORG/age-inbox-cli:latest --help
+docker run -it --rm ghcr.io/cypherbits/age-inbox-cli:latest --help
 ```
 
 ---
