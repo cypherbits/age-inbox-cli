@@ -1,0 +1,427 @@
+openapi: 3.0.3
+info:
+  title: Age Inbox API
+  description: A REST API for creating Age-encrypted password-protected file inboxes. Supports encrypted metadata, subfolders on-the-fly, raw (locked) file access, and HTTP Range requests.
+  version: 1.3.0
+  license:
+    name: MIT
+servers:
+  - url: http://127.0.0.1:3000
+    description: Local development server
+components:
+  schemas:
+    GenericRes:
+      type: object
+      properties:
+        message:
+          type: string
+    ErrorRes:
+      type: object
+      properties:
+        error:
+          type: string
+    FileMetadata:
+      type: object
+      properties:
+        filename:
+          type: string
+          nullable: true
+        origin:
+          type: string
+          nullable: true
+        filesize:
+          type: integer
+          format: uint64
+          description: Size of the encrypted .age file on disk (in bytes).
+      additionalProperties: true
+    ListedFile:
+      type: object
+      properties:
+        path:
+          type: string
+        filename:
+          type: string
+          nullable: true
+        origin:
+          type: string
+          nullable: true
+        size:
+          type: integer
+          format: uint64
+          description: Size of the encrypted .age file on disk (in bytes).
+      required:
+        - path
+        - size
+    RawListedFile:
+      type: object
+      properties:
+        path:
+          type: string
+        size:
+          type: integer
+          format: uint64
+          description: Size of the encrypted .age file on disk (in bytes).
+      required:
+        - path
+        - size
+paths:
+  /inbox:
+    post:
+      operationId: createInbox
+      summary: Create a new vault/inbox
+      description: Derives an Age identity from the provided password and creates a new vault on disk.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - name
+                - password
+              properties:
+                name:
+                  type: string
+                  description: Unique name for the vault.
+                password:
+                  type: string
+                  description: Password to derive the key using Argon2id.
+                allow_subfolders:
+                  type: boolean
+                  description: Configuration to allow creation of folders on the fly during upload. Default is false.
+      responses:
+        '200':
+          description: Vault successfully created.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  public_key:
+                    type: string
+        '400':
+          description: Invalid vault name.
+        '409':
+          description: Vault already exists.
+  /inbox/{name}/upload:
+    post:
+      operationId: uploadFileRoot
+      summary: Upload a file to a vault root
+      description: Streams request body through Age encryption and saves to the vault root. Metadata must be sent in `multipart/form-data` fields to avoid HTTP header size limits. Generates a separate `.meta.age` encrypted file.
+      security: []
+      parameters:
+        - in: path
+          name: name
+          required: true
+          schema:
+            type: string
+          description: The name of the vault.
+      requestBody:
+        required: true
+        description: Raw binary data or multipart payload. For metadata (`filename`, `origin`, `extended`) use multipart fields.
+        content:
+          application/octet-stream:
+            schema:
+              type: string
+              format: binary
+          'multipart/form-data':
+            schema:
+              type: object
+              properties:
+                filename:
+                  type: string
+                  description: The original filename.
+                origin:
+                  type: string
+                  description: The source origin string.
+                extended:
+                  type: string
+                  description: A JSON encoded object of additional external properties.
+                file:
+                  type: string
+                  format: binary
+                  description: The binary file to encrypt and save.
+      responses:
+        '200':
+          description: File successfully encrypted and stored with metadata.
+  /inbox/{name}/upload/{path}:
+    post:
+      operationId: uploadFilePath
+      summary: Upload a file to a subfolder within a vault
+      description: Encrypts stream directly to a nested folder inside the vault. Metadata must be sent in `multipart/form-data` fields to avoid HTTP header size limits. Fails if vault configuration disabled nested folders.
+      security: []
+      parameters:
+        - in: path
+          name: name
+          required: true
+          schema:
+            type: string
+          description: The name of the vault.
+        - in: path
+          name: path
+          required: true
+          schema:
+            type: string
+          description: The relative subfolder path.
+      requestBody:
+        required: true
+        description: File payload stream or multipart form. Use multipart to include metadata fields.
+        content:
+          application/octet-stream:
+            schema:
+              type: string
+              format: binary
+          'multipart/form-data':
+            schema:
+              type: object
+              properties:
+                filename:
+                  type: string
+                origin:
+                  type: string
+                extended:
+                  type: string
+                file:
+                  type: string
+                  format: binary
+      responses:
+        '200':
+          description: File stored within the specified bounded nested folder.
+        '403':
+          description: Subfolders prohibited by configuration.
+  /inbox/{name}/unlock:
+    post:
+      operationId: unlockVault
+      summary: Temporarily unlock a vault
+      description: Validates the password and temporarily caches the derived Age private key in-memory for 1 hour.
+      security: []
+      parameters:
+        - in: path
+          name: name
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - password
+              properties:
+                password:
+                  type: string
+      responses:
+        '200':
+          description: Vault unlocked successfully.
+        '401':
+          description: Invalid password/unauthorized.
+  /inbox/{name}/lock:
+    post:
+      operationId: lockVault
+      summary: Immediately lock a vault
+      parameters:
+        - in: path
+          name: name
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Vault locked.
+  /inbox/{name}/list:
+    get:
+      operationId: listFiles
+      summary: List files in an unlocked vault (with metadata)
+      description: Recursively retrieves encrypted file paths (excluding metadata sidecars). Decrypts metadata to include `filename`, `origin`, and reports the encrypted file `size` in bytes for each file. Requires the vault to be unlocked.
+      parameters:
+        - in: path
+          name: name
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: JSON array of file items with metadata summary and file size.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/ListedFile'
+        '401':
+          description: Vault is locked.
+  /inbox/{name}/download/{path}:
+    get:
+      operationId: downloadFile
+      summary: Download and decrypt a file
+      description: Streams requested encrypted file back to the client decrypted. This endpoint only accepts file paths ending in `.age` (excluding `.meta.age`). Supports HTTP Range requests on the decrypted content. Returns `Accept-Ranges: bytes` header.
+      parameters:
+        - in: path
+          name: name
+          required: true
+          schema:
+            type: string
+        - in: path
+          name: path
+          required: true
+          schema:
+            type: string
+          description: Relative path for the file inside the vault.
+        - in: header
+          name: Range
+          required: false
+          schema:
+            type: string
+          description: 'HTTP Range header for partial content (e.g. `bytes=0-1023`).'
+      responses:
+        '200':
+          description: The decrypted binary file.
+          headers:
+            Accept-Ranges:
+              schema:
+                type: string
+              description: 'Always `bytes`.'
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        '206':
+          description: Partial decrypted content for the requested byte range.
+          headers:
+            Content-Range:
+              schema:
+                type: string
+              description: 'Byte range and total size (e.g. `bytes 0-1023/4096`).'
+            Accept-Ranges:
+              schema:
+                type: string
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        '400':
+          description: Invalid path or metadata sidecar path provided.
+        '401':
+          description: Session locked.
+        '416':
+          description: Range not satisfiable.
+  /inbox/{name}/metadata/{path}:
+    get:
+      operationId: downloadMetadata
+      summary: Get decrypted metadata for a file
+      description: Returns decrypted metadata from the sidecar `.meta.age` associated with an encrypted file path. Includes the encrypted file size on disk as `filesize`.
+      parameters:
+        - in: path
+          name: name
+          required: true
+          schema:
+            type: string
+        - in: path
+          name: path
+          required: true
+          schema:
+            type: string
+          description: Relative path to the encrypted file inside the vault (must end with `.age` and not `.meta.age`).
+      responses:
+        '200':
+          description: Decrypted metadata as JSON, including filesize.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FileMetadata'
+        '400':
+          description: Invalid path.
+        '401':
+          description: Session locked.
+        '404':
+          description: Metadata sidecar not found.
+  /inbox/{name}/raw/list:
+    get:
+      operationId: listFilesRaw
+      summary: List files in a vault (no unlock required)
+      description: Recursively retrieves encrypted file paths and their sizes on disk. Does NOT decrypt metadata — returns only `path` and `size`. Works regardless of whether the vault is locked or unlocked.
+      parameters:
+        - in: path
+          name: name
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: JSON array of raw file items with path and size.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/RawListedFile'
+        '404':
+          description: Vault not found.
+  /inbox/{name}/raw/download/{path}:
+    get:
+      operationId: downloadFileRaw
+      summary: Download an encrypted file without decryption
+      description: Streams the encrypted `.age` file as-is without decryption. Works regardless of vault lock state. Supports HTTP Range requests for partial content with efficient seeking.
+      parameters:
+        - in: path
+          name: name
+          required: true
+          schema:
+            type: string
+        - in: path
+          name: path
+          required: true
+          schema:
+            type: string
+          description: Relative path to the encrypted file inside the vault (must end with `.age`, not `.meta.age`).
+        - in: header
+          name: Range
+          required: false
+          schema:
+            type: string
+          description: 'HTTP Range header for partial content (e.g. `bytes=0-1023`).'
+      responses:
+        '200':
+          description: The encrypted binary file as-is.
+          headers:
+            Content-Length:
+              schema:
+                type: string
+            Accept-Ranges:
+              schema:
+                type: string
+              description: 'Always `bytes`.'
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        '206':
+          description: Partial encrypted content for the requested byte range.
+          headers:
+            Content-Range:
+              schema:
+                type: string
+              description: 'Byte range and total size (e.g. `bytes 0-1023/4096`).'
+            Content-Length:
+              schema:
+                type: string
+            Accept-Ranges:
+              schema:
+                type: string
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        '400':
+          description: Invalid path or not an .age file.
+        '404':
+          description: Vault or file not found.
