@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use clap::{Args as ClapArgs, Parser, Subcommand};
 use futures_util::stream::StreamExt;
-use reqwest::{Certificate, Client};
+use reqwest::{Certificate, Client, Url};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::env;
@@ -109,12 +109,12 @@ async fn build_client(pin_cert: Option<&PathBuf>) -> Result<Client> {
 
 async fn ensure_vault_exists(client: &Client, base_url: &str, vault: &str) -> Result<()> {
     info!("Checking if vault '{}' exists...", vault);
-    let raw_list_url = format!("{}/inbox/{}/raw/list", base_url, vault);
-    let res = client.get(&raw_list_url).send().await?;
+    let config_url = vault_url(base_url, vault, "config")?;
+    let res = client.get(&config_url).send().await?;
+    if res.status() == reqwest::StatusCode::NOT_FOUND {
+        anyhow::bail!("Vault '{}' not found on server", vault);
+    }
     if !res.status().is_success() {
-        if res.status() == reqwest::StatusCode::NOT_FOUND {
-            anyhow::bail!("Vault '{}' not found on server", vault);
-        }
         anyhow::bail!("Failed to query vault status: {}", res.status());
     }
 
@@ -147,7 +147,7 @@ async fn unlock_vault(args: &Args, client: &Client, base_url: &str) -> Result<()
     let password = Zeroizing::new(password_str);
 
     info!("Unlocking vault...");
-    let unlock_url = format!("{}/inbox/{}/unlock", base_url, args.vault);
+    let unlock_url = vault_url(base_url, &args.vault, "unlock")?;
     let unlock_req = json!({ "password": &*password });
     let res = client.post(&unlock_url).json(&unlock_req).send().await?;
 
@@ -160,7 +160,7 @@ async fn unlock_vault(args: &Args, client: &Client, base_url: &str) -> Result<()
 
 async fn lock_vault(args: &Args, client: &Client, base_url: &str) -> Result<()> {
     info!("Locking vault...");
-    let lock_url = format!("{}/inbox/{}/lock", base_url, args.vault);
+    let lock_url = vault_url(base_url, &args.vault, "lock")?;
     client.post(&lock_url).send().await?;
     Ok(())
 }
@@ -194,7 +194,7 @@ async fn run_downloads(
     }
 
     info!("Fetching file list...");
-    let list_url = format!("{}/inbox/{}/list", base_url, args.vault);
+    let list_url = vault_url(base_url, &args.vault, "list")?;
     let res = client.get(&list_url).send().await?;
     if !res.status().is_success() {
         anyhow::bail!("Failed to fetch file list: {}", res.status());
@@ -356,9 +356,9 @@ async fn upload_local_file(
 
     let remote_dir_url = path_to_url_path(remote_dir);
     let upload_url = if remote_dir_url.is_empty() {
-        format!("{}/inbox/{}/upload", base_url, vault)
+        vault_url(base_url, vault, "upload")?
     } else {
-        format!("{}/inbox/{}/upload/{}", base_url, vault, remote_dir_url)
+        vault_url_with_path(base_url, vault, "upload", &remote_dir_url)?
     };
 
     info!(
@@ -400,6 +400,50 @@ fn path_to_url_path(path: &Path) -> String {
         .join("/")
 }
 
+fn vault_url(base_url: &str, vault: &str, operation: &str) -> Result<String> {
+    let mut url = Url::parse(base_url).context("Invalid server URL")?;
+    {
+        let mut segments = url
+            .path_segments_mut()
+            .map_err(|_| anyhow::anyhow!("Server URL cannot be a base URL"))?;
+        segments.push("inbox");
+        segments.push(vault);
+        segments.push(operation);
+    }
+    Ok(url.into())
+}
+
+fn vault_url_with_path(base_url: &str, vault: &str, operation: &str, path: &str) -> Result<String> {
+    let mut url = Url::parse(base_url).context("Invalid server URL")?;
+    {
+        let mut segments = url
+            .path_segments_mut()
+            .map_err(|_| anyhow::anyhow!("Server URL cannot be a base URL"))?;
+        segments.push("inbox");
+        segments.push(vault);
+        segments.push(operation);
+        for segment in path.split('/').filter(|s| !s.is_empty() && *s != ".") {
+            segments.push(segment);
+        }
+    }
+    Ok(url.into())
+}
+
+/// Parses the `Content-Disposition` header and returns the `filename=` value when present.
+/// Example: `attachment; filename="report.pdf"` → `Some("report.pdf")`
+fn parse_content_disposition_filename(header: &str) -> Option<String> {
+    for part in header.split(';') {
+        let part = part.trim();
+        if part.to_lowercase().starts_with("filename=") {
+            let val = part["filename=".len()..].trim_matches('"');
+            if !val.is_empty() {
+                return Some(val.to_string());
+            }
+        }
+    }
+    None
+}
+
 async fn download_file(
     client: &Client,
     base_url: &str,
@@ -410,14 +454,18 @@ async fn download_file(
     metadata_filename: Option<&str>,
 ) -> Result<()> {
     let normalized_remote_path = remote_path.replace('\\', "/");
-    let download_url = format!(
-        "{}/inbox/{}/download/{}",
-        base_url, vault, normalized_remote_path
-    );
+    let download_url = vault_url_with_path(base_url, vault, "download", &normalized_remote_path)?;
     let res = client.get(&download_url).send().await?;
     if !res.status().is_success() {
         anyhow::bail!("Download request failed with status {}", res.status());
     }
+
+    // Prefer server-provided filename when available.
+    let filename_from_header: Option<String> = res
+        .headers()
+        .get(reqwest::header::CONTENT_DISPOSITION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(parse_content_disposition_filename);
 
     let mut stream = res.bytes_stream();
 
@@ -426,6 +474,8 @@ async fn download_file(
 
     let file_name = if let Some(fname) = metadata_filename {
         fname.to_string()
+    } else if let Some(fname) = filename_from_header {
+        fname
     } else {
         let base_name = file_path
             .file_name()
@@ -460,10 +510,7 @@ async fn download_file(
 
     if delete {
         info!("Deleting file from server: {}", normalized_remote_path);
-        let delete_url = format!(
-            "{}/inbox/{}/delete/{}",
-            base_url, vault, normalized_remote_path
-        );
+        let delete_url = vault_url_with_path(base_url, vault, "delete", &normalized_remote_path)?;
         let del_res = client.delete(&delete_url).send().await?;
         if !del_res.status().is_success() {
             warn!(
@@ -476,3 +523,4 @@ async fn download_file(
 
     Ok(())
 }
+

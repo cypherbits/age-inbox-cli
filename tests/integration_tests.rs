@@ -30,6 +30,10 @@ async fn mock_raw_list() -> impl IntoResponse {
     (StatusCode::OK, Json(vec![] as Vec<String>))
 }
 
+async fn mock_config() -> impl IntoResponse {
+    (StatusCode::OK, Json(serde_json::json!({"permissions": {}})))
+}
+
 async fn mock_unlock() -> impl IntoResponse {
     (StatusCode::OK, Json(serde_json::json!({"success": true})))
 }
@@ -112,6 +116,7 @@ async fn start_download_mock_server() -> (SocketAddr, oneshot::Sender<()>, Downl
 
     let app = Router::new()
         .route("/inbox/{vault}/raw/list", get(mock_raw_list))
+        .route("/inbox/{vault}/config", get(mock_config))
         .route("/inbox/{vault}/unlock", post(mock_unlock))
         .route("/inbox/{vault}/lock", post(mock_lock))
         .route("/inbox/{vault}/list", get(mock_list))
@@ -142,6 +147,7 @@ async fn start_upload_mock_server() -> (SocketAddr, oneshot::Sender<()>, UploadS
 
     let app = Router::new()
         .route("/inbox/{vault}/raw/list", get(mock_raw_list))
+        .route("/inbox/{vault}/config", get(mock_config))
         .route("/inbox/{vault}/upload", post(mock_upload_root))
         .route("/inbox/{vault}/upload/{*path}", post(mock_upload_path))
         .with_state(state.clone());
